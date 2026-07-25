@@ -11,12 +11,15 @@ into Django. Three views:
 
 import json
 import os
+import shutil
 
 from django.conf import settings
+from django.contrib.auth import login as auth_login
 from django.contrib.auth.decorators import login_required
+from django.contrib.auth.forms import UserCreationForm
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_POST, require_http_methods
 
 from .models import Chunk, Document, Notebook
 from .ingestion import load_documents
@@ -32,6 +35,22 @@ def _index_path(notebook_id):
     return os.path.join(INDEX_ROOT, f"notebook_{notebook_id}")
 
 
+def signup(request):
+    if request.user.is_authenticated:
+        return redirect("notebook_list")
+
+    if request.method == "POST":
+        form = UserCreationForm(request.POST)
+        if form.is_valid():
+            user = form.save()
+            auth_login(request, user)
+            return redirect("notebook_list")
+    else:
+        form = UserCreationForm()
+
+    return render(request, "pipeline/signup.html", {"form": form})
+
+
 @login_required
 def notebook_list(request):
     if request.method == "POST":
@@ -41,7 +60,7 @@ def notebook_list(request):
             return redirect("notebook_detail", notebook_id=notebook.id)
 
     notebooks = Notebook.objects.filter(user=request.user).order_by("-created_at")
-    return render(request, "pipeline/notebook_list.html", {"notebooks": notebooks})
+    return render(request, "pipeline/notebook_app.html", {"notebooks": notebooks})
 
 
 @login_required
@@ -50,9 +69,51 @@ def notebook_detail(request, notebook_id):
     documents = notebook.document_set.all().order_by("-uploaded_at")
     return render(
         request,
-        "pipeline/notebook_detail.html",
+        "pipeline/notebook_app.html",
         {"notebook": notebook, "documents": documents},
     )
+
+
+@login_required
+@require_http_methods(["POST", "DELETE"])
+def delete_notebook(request, notebook_id):
+    notebook = get_object_or_404(Notebook, id=notebook_id, user=request.user)
+
+    index_path = _index_path(notebook.id)
+    if os.path.exists(index_path):
+        shutil.rmtree(index_path)
+
+    notebook.delete()  # cascades to Document and Chunk rows automatically
+    return JsonResponse({"message": "Notebook deleted."})
+
+
+@login_required
+@require_http_methods(["POST", "DELETE"])
+def delete_document(request, notebook_id, document_id):
+    notebook = get_object_or_404(Notebook, id=notebook_id, user=request.user)
+    document = get_object_or_404(Document, id=document_id, notebook=notebook)
+
+    document.file.delete(save=False)  # removes the physical file from disk
+    document.delete()  # cascades to Chunk rows automatically
+
+    # Rebuild the index without this document. If no documents remain, just
+    # remove the index folder entirely.
+    remaining = notebook.document_set.exists()
+    index_path = _index_path(notebook.id)
+
+    if not remaining:
+        if os.path.exists(index_path):
+            shutil.rmtree(index_path)
+    else:
+        try:
+            _rebuild_notebook_index(notebook)
+        except Exception as e:
+            return JsonResponse(
+                {"error": f"Document removed, but failed to rebuild index: {e}"},
+                status=500,
+            )
+
+    return JsonResponse({"message": "Document removed."})
 
 
 @login_required
