@@ -1,0 +1,221 @@
+{% extends "pipeline/base.html" %}
+{% block title %}{{ notebook.title }}{% endblock %}
+
+{% block content %}
+<div class="max-w-5xl mx-auto px-6 py-8 grid md:grid-cols-[280px_1fr] gap-6">
+
+    <!-- Sidebar: documents -->
+    <aside class="border border-ink/10 rounded-xl bg-white p-4 h-fit">
+        <h2 class="font-medium text-sm mb-3">{{ notebook.title }}</h2>
+
+        <label for="file-input"
+               class="block border-2 border-dashed border-ink/15 rounded-lg p-4 text-center text-xs text-ink/50 cursor-pointer hover:border-accent/50 hover:text-accent transition mb-3">
+            <span id="upload-label">Click to upload PDF / DOCX / TXT</span>
+            <input id="file-input" type="file" multiple accept=".pdf,.docx,.txt" class="hidden">
+        </label>
+
+        <ul id="document-list" class="space-y-2 text-sm">
+            {% for doc in documents %}
+            <li class="flex items-center gap-2 text-ink/70">
+                <span class="w-1.5 h-1.5 rounded-full {% if doc.processed %}bg-green-500{% else %}bg-amber-400{% endif %}"></span>
+                <span class="truncate">{{ doc.filename }}</span>
+            </li>
+            {% empty %}
+            <li class="text-ink/40 text-xs">No documents yet.</li>
+            {% endfor %}
+        </ul>
+    </aside>
+
+    <!-- Chat area -->
+    <section class="border border-ink/10 rounded-xl bg-white flex flex-col h-[75vh]">
+        <div id="chat-log" class="flex-1 overflow-y-auto p-5 space-y-4">
+            <div class="text-sm text-ink/40 text-center pt-10">
+                Ask a question about the documents in this notebook.
+            </div>
+        </div>
+
+        <form id="chat-form" class="border-t border-ink/10 p-3 flex items-center gap-2">
+            {% csrf_token %}
+            <button type="button" id="mic-btn" title="Voice input"
+                    class="shrink-0 w-9 h-9 rounded-full border border-ink/15 flex items-center justify-center text-ink/50 hover:text-accent hover:border-accent/50 transition">
+                🎤
+            </button>
+            <input id="chat-input" type="text" autocomplete="off" placeholder="Ask a question…"
+                   class="flex-1 border border-ink/15 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent/40">
+            <button type="submit"
+                    class="shrink-0 px-4 py-2 bg-accent text-white text-sm font-medium rounded-lg hover:bg-accent/90 transition">
+                Send
+            </button>
+        </form>
+    </section>
+</div>
+
+<script>
+const notebookId = {{ notebook.id }};
+const csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
+
+/* ---------- File upload ---------- */
+const fileInput = document.getElementById('file-input');
+const uploadLabel = document.getElementById('upload-label');
+const documentList = document.getElementById('document-list');
+
+fileInput.addEventListener('change', async () => {
+    if (!fileInput.files.length) return;
+
+    const formData = new FormData();
+    for (const f of fileInput.files) formData.append('files', f);
+
+    uploadLabel.textContent = 'Uploading & indexing…';
+
+    try {
+        const res = await fetch(`/notebook/${notebookId}/upload/`, {
+            method: 'POST',
+            headers: { 'X-CSRFToken': csrfToken },
+            body: formData,
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+            uploadLabel.textContent = `Error: ${data.error}`;
+            return;
+        }
+
+        // Add new docs to the sidebar list
+        const emptyMsg = documentList.querySelector('li.text-ink\\/40');
+        if (emptyMsg) emptyMsg.remove();
+
+        data.documents.forEach(doc => {
+            const li = document.createElement('li');
+            li.className = 'flex items-center gap-2 text-ink/70';
+            li.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-green-500"></span><span class="truncate">${doc.filename}</span>`;
+            documentList.appendChild(li);
+        });
+
+        uploadLabel.textContent = 'Click to upload PDF / DOCX / TXT';
+    } catch (err) {
+        uploadLabel.textContent = 'Upload failed. Try again.';
+        console.error(err);
+    }
+});
+
+/* ---------- Chat ---------- */
+const chatForm = document.getElementById('chat-form');
+const chatInput = document.getElementById('chat-input');
+const chatLog = document.getElementById('chat-log');
+
+function clearEmptyState() {
+    const empty = chatLog.querySelector('.text-center.pt-10');
+    if (empty) empty.remove();
+}
+
+function addMessage(text, role, sources = []) {
+    clearEmptyState();
+    const wrapper = document.createElement('div');
+    wrapper.className = role === 'user' ? 'flex justify-end' : 'flex justify-start';
+
+    const bubble = document.createElement('div');
+    bubble.className = role === 'user'
+        ? 'max-w-[80%] bg-accent text-white rounded-2xl rounded-br-sm px-4 py-2 text-sm'
+        : 'max-w-[80%] bg-ink/5 rounded-2xl rounded-bl-sm px-4 py-2 text-sm';
+    bubble.textContent = text;
+    wrapper.appendChild(bubble);
+    chatLog.appendChild(wrapper);
+
+    if (sources.length) {
+        const srcDiv = document.createElement('div');
+        srcDiv.className = 'flex justify-start';
+        srcDiv.innerHTML = `<div class="max-w-[80%] text-xs text-ink/40 px-2 pt-1">Sources: ${sources.join(', ')}</div>`;
+        chatLog.appendChild(srcDiv);
+    }
+
+    chatLog.scrollTop = chatLog.scrollHeight;
+    return bubble;
+}
+
+async function sendQuestion(question) {
+    if (!question.trim()) return;
+
+    addMessage(question, 'user');
+    chatInput.value = '';
+    const thinkingBubble = addMessage('Thinking…', 'assistant');
+
+    try {
+        const res = await fetch(`/notebook/${notebookId}/ask/`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': csrfToken,
+            },
+            body: JSON.stringify({ question }),
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+            thinkingBubble.textContent = `Error: ${data.error}`;
+            return;
+        }
+
+        thinkingBubble.textContent = data.answer;
+        if (data.sources && data.sources.length) {
+            const srcDiv = document.createElement('div');
+            srcDiv.className = 'text-xs text-ink/40 px-2 pt-1';
+            srcDiv.textContent = `Sources: ${data.sources.join(', ')}`;
+            thinkingBubble.parentElement.after(srcDiv);
+        }
+
+        speakAnswer(data.answer);
+    } catch (err) {
+        thinkingBubble.textContent = 'Something went wrong. Try again.';
+        console.error(err);
+    }
+}
+
+chatForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    sendQuestion(chatInput.value);
+});
+
+/* ---------- Voice input (Web Speech API) ---------- */
+const micBtn = document.getElementById('mic-btn');
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognition = null;
+
+if (SpeechRecognition) {
+    recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = 'en-US';
+
+    recognition.onstart = () => {
+        micBtn.classList.add('text-accent', 'border-accent/50');
+        micBtn.textContent = '●';
+    };
+    recognition.onend = () => {
+        micBtn.classList.remove('text-accent', 'border-accent/50');
+        micBtn.textContent = '🎤';
+    };
+    recognition.onresult = (event) => {
+        const transcript = event.results[0][0].transcript;
+        chatInput.value = transcript;
+        sendQuestion(transcript);
+    };
+    recognition.onerror = (event) => {
+        console.error('Speech recognition error:', event.error);
+    };
+
+    micBtn.addEventListener('click', () => recognition.start());
+} else {
+    micBtn.disabled = true;
+    micBtn.title = 'Voice input not supported in this browser';
+    micBtn.classList.add('opacity-30', 'cursor-not-allowed');
+}
+
+/* ---------- Voice output (Web Speech API) ---------- */
+function speakAnswer(text) {
+    if (!('speechSynthesis' in window)) return;
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1;
+    speechSynthesis.speak(utterance);
+}
+</script>
+{% endblock %}
